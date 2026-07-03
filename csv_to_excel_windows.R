@@ -1,7 +1,8 @@
 # CSVファイルをExcel形式（.xlsx）に一括変換するWindows版スクリプト
+# 区切り文字を自動判定し、1行目もデータとして保持する版
 
 # ===== 必要パッケージ =====
-required_packages <- c("readr", "writexl", "tibble")
+required_packages <- c("writexl")
 
 for (pkg in required_packages) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
@@ -9,34 +10,28 @@ for (pkg in required_packages) {
   }
 }
 
-library(readr)
 library(writexl)
-library(tibble)
 
 # ===== 設定 =====
 
-# Windows用：Desktop/R/csv_files を入力フォルダにする
 input_dir <- file.path(Sys.getenv("USERPROFILE"), "Desktop", "R", "csv_files")
-
-# Windows用：Desktop/R/excel_conv_output_files を出力フォルダにする
 output_dir <- file.path(Sys.getenv("USERPROFILE"), "Desktop", "R", "excel_conv_output_files")
 
-# 出力フォルダがなければ作成
 if (!dir.exists(output_dir)) {
   dir.create(output_dir, recursive = TRUE)
 }
 
-# 入力フォルダが存在しない場合は停止
 if (!dir.exists(input_dir)) {
   stop("入力フォルダが見つかりません: ", input_dir)
 }
 
-# CSVファイル一覧
 csv_files <- list.files(
   input_dir,
   pattern = "\\.[Cc][Ss][Vv]$",
   full.names = TRUE
 )
+
+csv_files <- csv_files[!grepl("(^~\\$)|(^\\._)", basename(csv_files))]
 
 if (length(csv_files) == 0) {
   stop(sprintf("CSVが見つかりませんでした: %s", input_dir))
@@ -53,36 +48,107 @@ make_xlsx_path <- function(csv_path) {
   file.path(output_dir, paste0(fn, ".xlsx"))
 }
 
-# 文字コードを変えながらCSVを読み込む
-read_csv_safely <- function(csv_path) {
-  encodings <- c("UTF-8", "CP932", "Shift-JIS")
+# 区切り文字を推定する
+detect_delimiter <- function(csv_path, encoding) {
+  candidates <- c("," = ",", "tab" = "\t", ";" = ";", "|" = "|")
+
+  scores <- sapply(candidates, function(sep) {
+    con <- file(csv_path, open = "r", encoding = encoding)
+    on.exit(close(con), add = TRUE)
+
+    fields <- tryCatch(
+      count.fields(
+        con,
+        sep = sep,
+        quote = "\"",
+        blank.lines.skip = FALSE,
+        comment.char = ""
+      ),
+      error = function(e) integer(0)
+    )
+
+    fields <- fields[!is.na(fields)]
+
+    if (length(fields) == 0) {
+      return(0)
+    }
+
+    # 1行あたりの列数が多い区切り文字を採用
+    median(fields)
+  })
+
+  best <- names(scores)[which.max(scores)]
+
+  if (is.na(best) || scores[[best]] <= 1) {
+    return(",")
+  }
+
+  candidates[[best]]
+}
+
+# CSVをセル配置優先で読む
+read_csv_keep_cells <- function(csv_path) {
+  encodings <- c("UTF-8-BOM", "UTF-8", "CP932", "Shift-JIS")
 
   last_error <- NULL
 
   for (enc in encodings) {
-    result <- try(
-      readr::read_csv(
-        file = csv_path,
-        locale = readr::locale(encoding = enc),
-        show_col_types = FALSE,
-        guess_max = 10000,
-        name_repair = "unique"
-      ),
-      silent = TRUE
-    )
+    result <- tryCatch({
+      sep <- detect_delimiter(csv_path, enc)
 
-    if (!inherits(result, "try-error")) {
-      attr(result, "used_encoding") <- enc
+      con <- file(csv_path, open = "r", encoding = enc)
+      on.exit(close(con), add = TRUE)
+
+      field_counts <- count.fields(
+        con,
+        sep = sep,
+        quote = "\"",
+        blank.lines.skip = FALSE,
+        comment.char = ""
+      )
+
+      field_counts <- field_counts[!is.na(field_counts)]
+
+      if (length(field_counts) == 0) {
+        stop("列数を判定できませんでした。")
+      }
+
+      max_cols <- max(field_counts)
+
+      df <- read.table(
+        file = csv_path,
+        sep = sep,
+        quote = "\"",
+        header = FALSE,
+        fill = TRUE,
+        col.names = paste0("X", seq_len(max_cols)),
+        colClasses = "character",
+        stringsAsFactors = FALSE,
+        check.names = FALSE,
+        comment.char = "",
+        blank.lines.skip = FALSE,
+        na.strings = "",
+        fileEncoding = enc
+      )
+
+      attr(df, "used_encoding") <- enc
+      attr(df, "used_separator") <- ifelse(sep == "\t", "TAB", sep)
+
+      df
+    }, error = function(e) {
+      last_error <<- e
+      NULL
+    })
+
+    if (!is.null(result)) {
       return(result)
     }
-
-    last_error <- result
   }
 
-  stop("CSVの読み込みに失敗しました: ", basename(csv_path), "\n", as.character(last_error))
+  stop("CSVの読み込みに失敗しました: ", basename(csv_path), "\n", last_error$message)
 }
 
-# ===== 実行：失敗しても次へ =====
+# ===== 実行 =====
 
 ok_list <- character(0)
 ng_list <- list()
@@ -93,22 +159,24 @@ for (csv in csv_files) {
   message("Converting: ", basename(csv), " -> ", basename(xlsx))
 
   res <- try({
-    df <- read_csv_safely(csv)
+    df <- read_csv_keep_cells(csv)
 
     used_encoding <- attr(df, "used_encoding")
+    used_separator <- attr(df, "used_separator")
+
     message("  Encoding: ", used_encoding)
+    message("  Separator: ", used_separator)
 
-    # writexl用に通常のdata.frameへ変換
-    df <- as.data.frame(df)
-
-    # 既存ファイルがあれば削除
     if (file.exists(xlsx)) {
       unlink(xlsx)
     }
 
+    # col_names = FALSE が重要
+    # これにより、R側のX1, X2などの列名をExcelに書き出さない
     write_xlsx(
       x = list(Sheet1 = df),
-      path = xlsx
+      path = xlsx,
+      col_names = FALSE
     )
 
     if (!file.exists(xlsx)) {
